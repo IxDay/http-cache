@@ -66,6 +66,7 @@ type Client struct {
 	refreshKey         string
 	methods            []string
 	writeExpiresHeader bool
+	vary               []string
 	generateKey        GenerateKey
 }
 
@@ -89,6 +90,7 @@ type GenerateKey func(*http.Request) []byte
 
 // Middleware is the HTTP cache middleware handler.
 func (c *Client) Middleware(next http.Handler) http.Handler {
+	vary := strings.Join(c.vary, ",")
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if !c.cacheableMethod(r.Method) {
 			next.ServeHTTP(w, r)
@@ -96,14 +98,14 @@ func (c *Client) Middleware(next http.Handler) http.Handler {
 		}
 
 		sortURLParams(r.URL)
-		key := hash(c.generateKey(r))
+		key := c.hash(r)
 
 		params := r.URL.Query()
 		if _, ok := params[c.refreshKey]; ok {
 			delete(params, c.refreshKey)
 
 			r.URL.RawQuery = params.Encode()
-			key = hash(c.generateKey(r))
+			key = c.hash(r)
 
 			c.adapter.Release(key)
 		} else {
@@ -121,6 +123,9 @@ func (c *Client) Middleware(next http.Handler) http.Handler {
 					}
 					if c.writeExpiresHeader {
 						w.Header().Set("Expires", response.Expiration.UTC().Format(http.TimeFormat))
+					}
+					if vary != "" {
+						w.Header().Set("Vary", vary)
 					}
 					w.Write(response.Value)
 					return
@@ -192,9 +197,14 @@ func KeyAsString(key uint64) string {
 	return strconv.FormatUint(key, 36)
 }
 
-func hash(key []byte) uint64 {
+func (c *Client) hash(r *http.Request) uint64 {
 	hash := fnv.New64a()
-	hash.Write(key)
+	hash.Write(c.generateKey(r))
+	for _, header := range c.vary {
+		if value := strings.Join(r.Header.Values(header), ""); value != "" {
+			hash.Write([]byte(value))
+		}
+	}
 	return hash.Sum64()
 }
 
@@ -286,6 +296,13 @@ func ClientWithMethods(methods []string) ClientOption {
 func ClientWithGenerateKey(fn GenerateKey) ClientOption {
 	return func(c *Client) error {
 		c.generateKey = fn
+		return nil
+	}
+}
+
+func ClientWithVary(headers ...string) ClientOption {
+	return func(c *Client) error {
+		c.vary = headers
 		return nil
 	}
 }
