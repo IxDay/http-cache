@@ -1,4 +1,4 @@
-module github.com/victorspringer/http-cache
+module github.com/IxDay/http-cache
 
 go 1.18
 

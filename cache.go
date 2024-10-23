@@ -66,6 +66,7 @@ type Client struct {
 	refreshKey         string
 	methods            []string
 	writeExpiresHeader bool
+	generateKey        GenerateKey
 }
 
 // ClientOption is used to set Client settings.
@@ -84,78 +85,68 @@ type Adapter interface {
 	Release(key uint64)
 }
 
+type GenerateKey func(*http.Request) []byte
+
 // Middleware is the HTTP cache middleware handler.
 func (c *Client) Middleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if c.cacheableMethod(r.Method) {
-			sortURLParams(r.URL)
-			key := generateKey(r.URL.String())
-			if r.Method == http.MethodPost && r.Body != nil {
-				body, err := io.ReadAll(r.Body)
-				defer r.Body.Close()
-				if err != nil {
-					next.ServeHTTP(w, r)
-					return
-				}
-				reader := io.NopCloser(bytes.NewBuffer(body))
-				key = generateKeyWithBody(r.URL.String(), body)
-				r.Body = reader
-			}
-
-			params := r.URL.Query()
-			if _, ok := params[c.refreshKey]; ok {
-				delete(params, c.refreshKey)
-
-				r.URL.RawQuery = params.Encode()
-				key = generateKey(r.URL.String())
-
-				c.adapter.Release(key)
-			} else {
-				b, ok := c.adapter.Get(key)
-				response := BytesToResponse(b)
-				if ok {
-					if response.Expiration.After(time.Now()) {
-						response.LastAccess = time.Now()
-						response.Frequency++
-						c.adapter.Set(key, response.Bytes(), response.Expiration)
-
-						//w.WriteHeader(http.StatusNotModified)
-						for k, v := range response.Header {
-							w.Header().Set(k, strings.Join(v, ","))
-						}
-						if c.writeExpiresHeader {
-							w.Header().Set("Expires", response.Expiration.UTC().Format(http.TimeFormat))
-						}
-						w.Write(response.Value)
-						return
-					}
-
-					c.adapter.Release(key)
-				}
-			}
-
-			rw := &responseWriter{ResponseWriter: w}
-			next.ServeHTTP(rw, r)
-
-			statusCode := rw.statusCode
-			value := rw.body
-			now := time.Now()
-			expires := now.Add(c.ttl)
-			if statusCode < 400 {
-				response := Response{
-					Value:      value,
-					Header:     rw.Header(),
-					Expiration: expires,
-					LastAccess: now,
-					Frequency:  1,
-				}
-				c.adapter.Set(key, response.Bytes(), response.Expiration)
-			}
-
+		if !c.cacheableMethod(r.Method) {
+			next.ServeHTTP(w, r)
 			return
 		}
 
-		next.ServeHTTP(w, r)
+		sortURLParams(r.URL)
+		key := hash(c.generateKey(r))
+
+		params := r.URL.Query()
+		if _, ok := params[c.refreshKey]; ok {
+			delete(params, c.refreshKey)
+
+			r.URL.RawQuery = params.Encode()
+			key = hash(c.generateKey(r))
+
+			c.adapter.Release(key)
+		} else {
+			b, ok := c.adapter.Get(key)
+			response := BytesToResponse(b)
+			if ok {
+				if response.Expiration.After(time.Now()) {
+					response.LastAccess = time.Now()
+					response.Frequency++
+					c.adapter.Set(key, response.Bytes(), response.Expiration)
+
+					//w.WriteHeader(http.StatusNotModified)
+					for k, v := range response.Header {
+						w.Header().Set(k, strings.Join(v, ","))
+					}
+					if c.writeExpiresHeader {
+						w.Header().Set("Expires", response.Expiration.UTC().Format(http.TimeFormat))
+					}
+					w.Write(response.Value)
+					return
+				}
+
+				c.adapter.Release(key)
+			}
+		}
+
+		rw := &responseWriter{ResponseWriter: w}
+		next.ServeHTTP(rw, r)
+
+		statusCode := rw.statusCode
+		value := rw.body
+		now := time.Now()
+		expires := now.Add(c.ttl)
+		if statusCode < 400 {
+			response := Response{
+				Value:      value,
+				Header:     rw.Header(),
+				Expiration: expires,
+				LastAccess: now,
+				Frequency:  1,
+			}
+			c.adapter.Set(key, response.Bytes(), response.Expiration)
+		}
 	})
 }
 
@@ -201,19 +192,22 @@ func KeyAsString(key uint64) string {
 	return strconv.FormatUint(key, 36)
 }
 
-func generateKey(URL string) uint64 {
+func hash(key []byte) uint64 {
 	hash := fnv.New64a()
-	hash.Write([]byte(URL))
-
+	hash.Write(key)
 	return hash.Sum64()
 }
 
-func generateKeyWithBody(URL string, body []byte) uint64 {
-	hash := fnv.New64a()
-	body = append([]byte(URL), body...)
-	hash.Write(body)
-
-	return hash.Sum64()
+func DefaultGenerateKey(r *http.Request) []byte {
+	if r.Method == http.MethodPost && r.Body != nil {
+		body, err := io.ReadAll(r.Body)
+		if err != nil {
+			return nil
+		}
+		r.Body = io.NopCloser(bytes.NewBuffer(body))
+		return append([]byte(r.URL.String()), body...)
+	}
+	return []byte(r.URL.String())
 }
 
 // NewClient initializes the cache HTTP middleware client with the given
@@ -235,6 +229,9 @@ func NewClient(opts ...ClientOption) (*Client, error) {
 	}
 	if c.methods == nil {
 		c.methods = []string{http.MethodGet}
+	}
+	if c.generateKey == nil {
+		c.generateKey = DefaultGenerateKey
 	}
 
 	return c, nil
@@ -281,6 +278,14 @@ func ClientWithMethods(methods []string) ClientOption {
 			}
 		}
 		c.methods = methods
+		return nil
+	}
+}
+
+// ClientWithHeaders
+func ClientWithGenerateKey(fn GenerateKey) ClientOption {
+	return func(c *Client) error {
+		c.generateKey = fn
 		return nil
 	}
 }
